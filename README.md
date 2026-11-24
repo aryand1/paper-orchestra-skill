@@ -348,4 +348,4 @@ including commercially, as long as the copyright notice is kept. The port of
 Google's code in `skills/paper-orchestra/scripts/po_official/` stays under
 Apache-2.0 (Copyright 2026 Google LLC); see its `LICENSE-APACHE-2.0` and
 `NOTICE`. The verbatim paper prompts are excerpts from arXiv:2604.05018, as
-noted in `LICENSE`.
+noted in [`NOTICE`](NOTICE).

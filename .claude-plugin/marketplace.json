@@ -3,6 +3,7 @@
   "owner": {
     "name": "Aryan Dalal"
   },
+  "description": "PaperOrchestra paper-writing skills for coding agents (official-mode port of Google's pipeline).",
   "plugins": [
     {
       "name": "paper-orchestra",
