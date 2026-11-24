@@ -1,0 +1,15 @@
+This directory contains a modified port of PaperOrchestra
+(https://github.com/google-research/paper-orchestra, commit d9bae99),
+Copyright 2026 Google LLC, licensed under the Apache License, Version 2.0
+(see LICENSE-APACHE-2.0).
+
+Modifications (2026, PaperOrchestra skill pack): the Gemini client is replaced
+by a call layer (llm.py) that writes each model input to a file for a host
+coding agent to answer; pipeline branches are named so a run can be resumed;
+optional dependencies have fallbacks; diagrams are drawn as matplotlib code
+because the host has no image model. Each modified file states its changes in
+its header. The full line-by-line diff is in docs/official-port.diff.
+
+"PaperOrchestra" is the name of the method by Yiwen Song, Yale Song, Tomas
+Pfister and Jinsung Yoon (Google Cloud AI Research). This skill pack is an
+independent adaptation and is not an official Google product.

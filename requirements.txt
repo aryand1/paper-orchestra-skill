@@ -1,0 +1,18 @@
+# No LLM SDKs and no model API keys. LLM calls and web search are done by the
+# host coding agent. Official mode (po.py) also queries the Semantic Scholar
+# API directly, as Google's code does.
+
+# --- official mode (skills/paper-orchestra/scripts/po.py) ---
+pydantic>=2.0          # data models used by Google's literature agent
+requests>=2.28         # Semantic Scholar API
+Pillow>=9.0            # page grids for the formatting pass
+# optional, same results and closer to the official code:
+# thefuzz  pymupdf  json_repair
+
+# --- extended mode helpers ---
+
+jsonschema>=4.0        # outline schema validation
+python-Levenshtein>=0.21  # fuzzy title match for citation verification
+reportlab>=4.0         # fallback PDF builder (academic-paper style)
+matplotlib>=3.7        # plotting agent renderer helper patterns
+pypdf>=4.0             # optional: PDF ingestion for paper-writing-bench

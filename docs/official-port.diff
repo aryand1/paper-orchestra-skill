@@ -1,0 +1,2377 @@
+# Every change the port makes to google-research/paper-orchestra@d9bae99
+# Regenerate: python tools/official_port_diff.py /path/to/paper-orchestra
+#
+# file | official lines | +added | -removed
+#   methods/agents/outline_agent.py -> outline_agent.py | 60 | +7 | -4
+#   methods/agents/literature_review_agent.py -> literature_review_agent.py | 607 | +45 | -30
+#   methods/agents/section_writing_agent.py -> section_writing_agent.py | 218 | +6 | -3
+#   methods/agents/content_refinement_agent.py -> content_refinement_agent.py | 593 | +46 | -35
+#   methods/agents/plotting_agent.py -> plotting_agent.py | 274 | +31 | -24
+#   methods/paper_writer.py -> paper_writer.py | 443 | +40 | -268
+#   methods/paper_writer_with_plotting.py -> paper_writer_with_plotting.py | 520 | +39 | -282
+#   methods/prompts/outline_agent.py -> prompts/outline_agent.py | 199 | +5 | -2
+#   methods/prompts/literature_review_agent.py -> prompts/literature_review_agent.py | 47 | +4 | -1
+#   methods/prompts/section_writing_agent.py -> prompts/section_writing_agent.py | 80 | +4 | -1
+#   methods/prompts/content_refinement_agent.py -> prompts/content_refinement_agent.py | 85 | +4 | -1
+#   utils/prompt_utils.py -> prompt_utils.py | 43 | +0 | -0
+#   utils/common_utils.py -> common_utils.py | 54 | +0 | -0
+#   utils/paper_banana_utils.py -> paper_banana_utils.py | 681 | +103 | -29
+#   utils/scholar_utils.py -> scholar_utils.py | 100 | +96 | -4
+#   utils/pdf_utils.py -> pdf_utils.py | 293 | +125 | -159
+#   utils/gemini_utils.py -> llm.py | 354 | +271 | -198
+#   autoraters/agent_review.py -> agent_review.py | 211 | +38 | -15
+
+--- official/methods/agents/outline_agent.py
++++ po_official/outline_agent.py
+@@ -12,11 +12,14 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++#
++# MODIFIED (2026, PaperOrchestra skill pack), from methods/agents/outline_agent.py at
++# google-research/paper-orchestra@d9bae99: import paths only.
+ 
+-from utils.common_utils import load_md_file
+-from utils.gemini_utils import call_gemini_with_contents
++from po_official.common_utils import load_md_file
++from po_official.llm import call_gemini_with_contents
+ import json
+-from google.genai import types  # type: ignore
++from po_official.genai_shim import types
+ 
+-from methods.prompts.outline_agent import outline_agent_system_prompt
++from po_official.prompts.outline_agent import outline_agent_system_prompt
+ 
+ 
+--- official/methods/agents/literature_review_agent.py
++++ po_official/literature_review_agent.py
+@@ -12,4 +12,12 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++#
++# MODIFIED (2026, PaperOrchestra skill pack), from
++# methods/agents/literature_review_agent.py at google-research/paper-orchestra@d9bae99.
++# Changes: the 10-thread Google-search discovery pool runs as named branches
++# (llm.gather) so every pending search is handed to the host agent at once;
++# the 1 s Semantic Scholar wait is skipped for cached lookups; candidates are
++# enriched in task order (official: thread completion order). Prompts,
++# filters, keys, BibTeX, citation map and outline injection are unchanged.
+ 
+ import json
+@@ -21,11 +29,12 @@
+ from typing import List, Optional, Dict
+ from pydantic import BaseModel
+-from google.genai import types  # type: ignore
+-
+-from methods.prompts.literature_review_agent import (
++from po_official.genai_shim import types
++
++from po_official.prompts.literature_review_agent import (
+     literature_review_agent_writter_prompt,
+ )
+-from utils.gemini_utils import call_gemini_with_contents, parse_gemini_latex_results
+-from utils.scholar_utils import s2_title_search
++from po_official.llm import call_gemini_with_contents, parse_gemini_latex_results
++from po_official.llm import gather, scope
++from po_official.scholar_utils import s2_title_search, s2_is_cached
+ 
+ 
+@@ -142,7 +151,8 @@
+         # --- PHASE 3: WRITING ---
+         self._safe_print("✍️  Phase 3: Writing Introduction & Related Work...")
+-        latex_content = self._synthesize_content(
+-            updated_outline, final_papers_list, cutoff_date
+-        )
++        with scope("writer"):
++            latex_content = self._synthesize_content(
++                updated_outline, final_papers_list, cutoff_date
++            )
+ 
+         # --- PHASE 4: SAVING ---
+@@ -176,24 +186,24 @@
+         all_candidates_with_tasks = []
+ 
+-        with ThreadPoolExecutor(max_workers=10) as executor:  # Fast for Google Search!
+-            future_to_task = {
+-                executor.submit(
+-                    self._process_search_task_google, task, outline, cutoff_date
+-                ): task
+-                for task in active_tasks
+-            }
+-            for future in as_completed(future_to_task):
+-                task = future_to_task[future]
+-                try:
+-                    cands = future.result()
+-                    if cands:
+-                        for cand_item in cands:
+-                            all_candidates_with_tasks.append(
+-                                {"cand": cand_item, "task": task}
+-                            )
+-                except Exception as exc:
+-                    self._safe_print(
+-                        f"      ❌ Google Search failed for '{task['focus'][:20]}...': {exc}"
+-                    )
++        def _make_branch(idx, task):
++            def _branch():
++                with scope(f"task{idx:03d}"):
++                    try:
++                        return self._process_search_task_google(task, outline, cutoff_date)
++                    except Exception as exc:
++                        self._safe_print(
++                            f"      ❌ Google Search failed for '{task['focus'][:20]}...': {exc}"
++                        )
++                        return []
++            return _branch
++
++        with scope("discovery"):
++            branch_results = gather(
++                *[_make_branch(i, t) for i, t in enumerate(active_tasks)]
++            )
++        for task, cands in zip(active_tasks, branch_results):
++            if cands:
++                for cand_item in cands:
++                    all_candidates_with_tasks.append({"cand": cand_item, "task": task})
+ 
+         self._safe_print(
+@@ -203,6 +213,11 @@
+ 
+         for item in all_candidates_with_tasks:
+-            # wait 1s per query to avoid SS rate limits!
+-            time.sleep(1.0)
++            # wait 1s per query to avoid SS rate limits! (skipped when cached)
++            cand = item["cand"]
++            c_title = getattr(cand, "title", None) or (cand.get("title") if isinstance(cand, dict) else None)
++            c_year = getattr(cand, "year", None) or (cand.get("year") if isinstance(cand, dict) else None)
++            already = bool(c_title) and self._normalize_title(c_title) in registry
++            if not already and not s2_is_cached(c_title, c_year, cutoff_date):
++                time.sleep(1.0)
+             self._enrich_and_register_paper(
+                 item["cand"], item["task"], registry, cutoff_date
+--- official/methods/agents/section_writing_agent.py
++++ po_official/section_writing_agent.py
+@@ -12,4 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++#
++# MODIFIED (2026, PaperOrchestra skill pack), from methods/agents/section_writing_agent.py at
++# google-research/paper-orchestra@d9bae99: import paths only.
+ 
+ """
+@@ -33,7 +36,7 @@
+ from typing import List, Dict
+ 
+-from methods.prompts.section_writing_agent import section_writing_agent_prompt
+-from utils.gemini_utils import parse_gemini_latex_results
+-from utils.llm_backend_utils import call_llm_with_images
++from po_official.prompts.section_writing_agent import section_writing_agent_prompt
++from po_official.llm import parse_gemini_latex_results
++from po_official.llm import call_llm_with_images
+ 
+ import json
+--- official/methods/agents/content_refinement_agent.py
++++ po_official/content_refinement_agent.py
+@@ -12,4 +12,10 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++#
++# MODIFIED (2026, PaperOrchestra skill pack), from
++# methods/agents/content_refinement_agent.py at google-research/paper-orchestra@d9bae99.
++# Changes: each review, revision round and formatting call runs inside a named
++# llm.scope so a resumed run replays the same calls. The review ensemble,
++# refinement prompt, accept/revert rules and formatting pass are unchanged.
+ 
+ import os
+@@ -17,16 +23,17 @@
+ import json
+ import shutil
+-from google.genai import types  # type: ignore
+-
+-from utils.pdf_utils import compile_latex, load_paper, pdf_to_grid_images
+-from utils.gemini_utils import (
++from po_official.genai_shim import types
++
++from po_official.pdf_utils import compile_latex, load_paper, pdf_to_grid_images
++from po_official.llm import (
+     call_gemini_with_contents,
+     parse_gemini_json_latex_response,
+     call_gemini_with_images,
++    scope,
+ )
+ 
+-from autoraters.agent_review import perform_review_agentreview
+-
+-from methods.prompts.content_refinement_agent import (
++from po_official.agent_review import perform_review_agentreview
++
++from po_official.prompts.content_refinement_agent import (
+     content_refinement_agent_system_prompt,
+ )
+@@ -88,8 +95,9 @@
+             paper_text = load_paper(pdf_path=pdf_path)
+ 
+-            review = perform_review_agentreview(
+-                text=paper_text,
+-                model_name=self.model_name,
+-            )
++            with scope(f"review_{iteration_label}"):
++                review = perform_review_agentreview(
++                    text=paper_text,
++                    model_name=self.model_name,
++                )
+ 
+             score = review.get("Overall", 0)
+@@ -163,9 +171,10 @@
+ """
+             )
+-            response_dict = call_gemini_with_images(
+-                prompt=prompt,
+-                images=image_paths,
+-                model_name=self.model_name,
+-            )
++            with scope("format_review"):
++                response_dict = call_gemini_with_images(
++                    prompt=prompt,
++                    images=image_paths,
++                    model_name=self.model_name,
++                )
+ 
+             formatting_review = response_dict["parsed_response"]
+@@ -291,15 +300,16 @@
+             print(" >> calling Refinement Agent...")
+             try:
+-                response_dict = call_gemini_with_contents(
+-                    contents=[
+-                        types.Part.from_bytes(
+-                            data=pdf_bytes, mime_type="application/pdf"
+-                        ),
+-                        types.Part.from_text(text=user_prompt_text),
+-                    ],
+-                    generation_configs={"system_instruction": self.system_prompt},
+-                    model_name=self.model_name,
+-                    result_parsing_func=parse_gemini_json_latex_response,
+-                )
++                with scope(f"refine_iter{i+1}"):
++                    response_dict = call_gemini_with_contents(
++                        contents=[
++                            types.Part.from_bytes(
++                                data=pdf_bytes, mime_type="application/pdf"
++                            ),
++                            types.Part.from_text(text=user_prompt_text),
++                        ],
++                        generation_configs={"system_instruction": self.system_prompt},
++                        model_name=self.model_name,
++                        result_parsing_func=parse_gemini_json_latex_response,
++                    )
+ 
+                 parsed = json.loads(response_dict["parsed_response"])
+@@ -518,12 +528,13 @@
+ 
+             try:
+-                response_dict = call_gemini_with_contents(
+-                    contents=[
+-                        types.Part.from_text(text=prompt),
+-                    ],
+-                    model_name=self.model_name,
+-                    result_parsing_func=lambda x: {"raw_response": x},
+-                    check_parsed_response_not_none=False,
+-                )
++                with scope("format_fix"):
++                    response_dict = call_gemini_with_contents(
++                        contents=[
++                            types.Part.from_text(text=prompt),
++                        ],
++                        model_name=self.model_name,
++                        result_parsing_func=lambda x: {"raw_response": x},
++                        check_parsed_response_not_none=False,
++                    )
+ 
+                 raw_response = response_dict["raw_response"]
+--- official/methods/agents/plotting_agent.py
++++ po_official/plotting_agent.py
+@@ -12,4 +12,9 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++#
++# MODIFIED (2026, PaperOrchestra skill pack), from methods/agents/plotting_agent.py
++# at google-research/paper-orchestra@d9bae99. Changes: the 5-thread figure pool
++# runs as named branches (llm.gather) and results keep plan order (official:
++# completion order). The per-figure flow is unchanged.
+ 
+ import os
+@@ -18,6 +23,7 @@
+ import concurrent.futures
+ 
+-from utils.common_utils import load_md_file
+-from utils.paper_banana_utils import (
++from po_official.common_utils import load_md_file
++from po_official.llm import gather, scope
++from po_official.paper_banana_utils import (
+     retrieve_few_shot_examples,
+     predict_figure_content,
+@@ -225,26 +231,27 @@
+ 
+         results = []
+-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+-            futures = {
+-                executor.submit(
+-                    process_single_figure,
+-                    plan,
+-                    raw_materials_dir,
+-                    self.model_name,
+-                    self.image_model_name,
+-                    self.max_critic_rounds,
+-                ): plan
+-                for plan in plotting_plan
+-            }
+-            for future in concurrent.futures.as_completed(futures):
+-                try:
+-                    res = future.result()
+-                    results.append(res)
+-                except Exception as e:
+-                    plan = futures[future]
+-                    import traceback
+-
+-                    print(f"[ERROR] Failed processing {plan.get('figure_id')}: {e}")
+-                    traceback.print_exc()
++
++        def _make_branch(idx, plan):
++            def _branch():
++                with scope(f"fig{idx:02d}_{plan.get('figure_id', 'unknown')}"):
++                    try:
++                        return process_single_figure(
++                            plan,
++                            raw_materials_dir,
++                            self.model_name,
++                            self.image_model_name,
++                            self.max_critic_rounds,
++                        )
++                    except Exception as e:
++                        import traceback
++
++                        print(f"[ERROR] Failed processing {plan.get('figure_id')}: {e}")
++                        traceback.print_exc()
++                        return None
++            return _branch
++
++        for res in gather(*[_make_branch(i, pl) for i, pl in enumerate(plotting_plan)]):
++            if res is not None:
++                results.append(res)
+ 
+         if output_filepath:
+--- official/methods/paper_writer.py
++++ po_official/paper_writer.py
+@@ -12,4 +12,11 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++#
++# MODIFIED (2026, PaperOrchestra skill pack), from methods/paper_writer.py
++# at google-research/paper-orchestra@d9bae99. Changes: the 3-try loop resumes
++# from a saved attempt number (`start_try`, `on_try_failed`) because a run is
++# spread over several `po.py advance` invocations; each stage runs in a named
++# llm.scope; the batch-benchmark helpers were removed. The stage order,
++# file layout, copies and agent settings are unchanged.
+ 
+ import os
+@@ -18,13 +25,12 @@
+ import traceback
+ import json
+-import tqdm
+-from concurrent.futures import ProcessPoolExecutor, as_completed
+-
+-from methods.agents.outline_agent import OutlineAgent
+-from methods.agents.literature_review_agent import HybridLiteratureAgent
+-from methods.agents.section_writing_agent import SectionWritingAgent
+-from methods.agents.content_refinement_agent import ContentRefinementAgent
+-
+-from utils.common_utils import (
++
++from po_official.outline_agent import OutlineAgent
++from po_official.literature_review_agent import HybridLiteratureAgent
++from po_official.section_writing_agent import SectionWritingAgent
++from po_official.content_refinement_agent import ContentRefinementAgent
++from po_official import llm
++
++from po_official.common_utils import (
+     create_log_folder,
+ )
+@@ -39,4 +45,6 @@
+     reflection_model_name: str = "gemini-3.1-pro-preview",
+     research_cutoff: str = "2024-11",
++    start_try: int = 0,
++    on_try_failed=None,
+ ):
+     latex_writeup_dir = osp.join(base_dir, "latex_writeup")
+@@ -57,8 +65,9 @@
+ 
+     max_n_tries = 3
+-    cur_try = 0
++    cur_try = start_try
+     succeed = False
+ 
+     while (not succeed) and (cur_try < max_n_tries):
++        llm.configure(llm._CTX["calls_dir"], attempt=cur_try + 1)
+         try:
+             assert osp.exists(
+@@ -95,11 +104,12 @@
+             )
+             outline_file_path = osp.join(base_dir, "outline.json")
+-            outline_agent.run(
+-                idea_file=idea_file_path,
+-                experimental_log_file=experimental_log_file_path,
+-                latex_template_file=latex_template_path,
+-                conference_guidelines_file=guidelines_path,
+-                output_filepath=outline_file_path,
+-            )
++            with llm.scope("outline"):
++                outline_agent.run(
++                    idea_file=idea_file_path,
++                    experimental_log_file=experimental_log_file_path,
++                    latex_template_file=latex_template_path,
++                    conference_guidelines_file=guidelines_path,
++                    output_filepath=outline_file_path,
++                )
+ 
+             ###############################################################################################
+@@ -115,8 +125,9 @@
+                 max_workers=3,
+             )
+-            literature_agent.run(
+-                outline_path=outline_file_path,
+-                cutoff_date=research_cutoff,
+-            )
++            with llm.scope("lit"):
++                literature_agent.run(
++                    outline_path=outline_file_path,
++                    cutoff_date=research_cutoff,
++                )
+             shutil.copy(
+                 osp.join(literature_agent_output_dir, "outline_v1.json"),
+@@ -148,5 +159,6 @@
+             )
+             raw_draft_tex_path = osp.join(latex_writeup_dir, "raw_draft_paper.tex")
+-            section_writing_agent.run(output_path=raw_draft_tex_path)
++            with llm.scope("section"):
++                section_writing_agent.run(output_path=raw_draft_tex_path)
+ 
+             ###############################################################################################
+@@ -173,7 +185,8 @@
+                 work_dir=content_refinement_workdir,
+             )
+-            content_refinment_agent_output_pdf_path = content_refinement_agent.run(
+-                texfile_path=raw_draft_tex_path
+-            )
++            with llm.scope("refine"):
++                content_refinment_agent_output_pdf_path = content_refinement_agent.run(
++                    texfile_path=raw_draft_tex_path
++                )
+             assert osp.exists(
+                 content_refinment_agent_output_pdf_path
+@@ -193,4 +206,6 @@
+             print(f"[Try {cur_try+1}/{max_n_tries}] EXCEPTION in perform_writeup:")
+             print(traceback.format_exc())
++            if on_try_failed is not None:
++                on_try_failed(cur_try + 1, traceback.format_exc())
+             cur_try += 1
+             if cur_try < max_n_tries:
+@@ -199,245 +214,2 @@
+     print(f"Writeup failed after {max_n_tries}! Stop here.")
+     return False
+-
+-
+-def process_paper_task(
+-    paper,
+-    output_dir,
+-    latex_template_dir,
+-    idea_filename,
+-    experimental_log_filename,
+-    writer_model_name,
+-    research_cutoff,
+-):
+-    """
+-    Worker function to process a single paper.
+-    Returns a dictionary with results to be handled by the main thread.
+-    """
+-    try:
+-        paper_id = paper["paper_id"]
+-        print(f"Starting processing for paper '{paper_id}'...")
+-
+-        paper_dest_dir = osp.join(output_dir, paper_id)
+-        os.makedirs(paper_dest_dir, exist_ok=True)
+-        final_paper_path = osp.join(paper_dest_dir, "final_paper.pdf")
+-
+-        result = {
+-            "paper_id": paper_id,
+-            "status": "failed",
+-            "paper_path": "",
+-        }
+-
+-        if True:
+-            shutil.rmtree(paper_dest_dir, ignore_errors=True)
+-            os.makedirs(paper_dest_dir, exist_ok=True)
+-
+-            content_dest_dir = osp.join(paper_dest_dir, "raw_materials")
+-            os.makedirs(content_dest_dir, exist_ok=True)
+-            print(
+-                f"Copying content_folder from {paper['content_folder']} to {content_dest_dir}..."
+-            )
+-            shutil.copytree(
+-                src=paper["content_folder"], dst=content_dest_dir, dirs_exist_ok=True
+-            )
+-            print(f"Copying original paper to {content_dest_dir}...")
+-            shutil.copy(
+-                src=paper["pdf_path"],
+-                dst=osp.join(content_dest_dir, "original_paper.pdf"),
+-            )
+-
+-            success = write_single_paper(
+-                base_dir=paper_dest_dir,
+-                latex_template_dir=latex_template_dir,
+-                idea_filename=idea_filename,
+-                experimental_log_filename=experimental_log_filename,
+-                writer_model_name=writer_model_name,
+-                research_cutoff=research_cutoff,
+-            )
+-
+-            if success:
+-                result["status"] = "success"
+-                result["paper_path"] = final_paper_path
+-                print(f"Paper {paper_id} successfully written!")
+-            else:
+-                print(f"Paper {paper_id} writing failed.")
+-                return result
+-
+-        return result
+-
+-    except Exception as e:
+-        print(f"CRITICAL ERROR in worker for paper {paper['paper_id']}: {e}")
+-        print(traceback.format_exc())
+-        return {"paper_id": paper["paper_id"], "status": "error", "error": str(e)}
+-
+-
+-def _load_papers_from_config(
+-    process_root_folder: bool,
+-    root_input_folder: str,
+-    paper_info_path: str,
+-    n_papers: int,
+-):
+-    """Loads a list of paper dictionaries from either a root folder or a JSON file."""
+-    if process_root_folder:
+-        if not root_input_folder:
+-            raise ValueError(
+-                "Please provide root_input_folder if process_root_folder is True."
+-            )
+-        all_papers_candidates = []
+-        all_paper_ids_raw = os.listdir(root_input_folder)
+-        all_paper_ids = [
+-            paper_id
+-            for paper_id in all_paper_ids_raw
+-            if os.path.isdir(os.path.join(root_input_folder, paper_id))
+-        ]
+-        for paper_id in all_paper_ids:
+-            content_folder = os.path.join(root_input_folder, paper_id, "raw_materials")
+-            pdf_path = os.path.join(root_input_folder, paper_id, f"{paper_id}.pdf")
+-            if not os.path.exists(content_folder) or not os.path.exists(pdf_path):
+-                continue
+-            paper_entry = {
+-                "paper_id": paper_id,
+-                "content_folder": content_folder,
+-                "pdf_path": pdf_path,
+-            }
+-            all_papers_candidates.append(paper_entry)
+-    else:
+-        if not paper_info_path:
+-            raise ValueError(
+-                "Please provide paper_info_path if process_root_folder is False."
+-            )
+-        with open(paper_info_path, "r") as f:
+-            all_papers_candidates = json.load(f)
+-
+-    if n_papers < 0:
+-        n_papers = len(all_papers_candidates)
+-    else:
+-        n_papers = min(n_papers, len(all_papers_candidates))
+-
+-    return all_papers_candidates[:n_papers]
+-
+-
+-def _load_logs(output_dir: str):
+-    """Loads existing logs to support resuming a batch job."""
+-    paper_writing_log_path = osp.join(output_dir, "paper_writing_log.json")
+-    write_log = {}
+-    if osp.exists(paper_writing_log_path):
+-        with open(paper_writing_log_path, "r") as f:
+-            write_log = json.load(f)
+-        print(f"Loaded existing writing log with {len(write_log)} entries.")
+-
+-    return write_log
+-
+-
+-def _filter_and_prepare_papers(
+-    all_papers, write_log, process_root_folder, paper_info_path
+-):
+-    """Filters out completed papers and resolves paths."""
+-    papers_to_process = []
+-    base_info_dir = ""
+-    if (not process_root_folder) and (paper_info_path != ""):
+-        base_info_dir = osp.dirname(paper_info_path)
+-
+-    for paper in all_papers:
+-        # Check if already successfully processed in log
+-        if (
+-            paper["paper_id"] in write_log
+-            and write_log[paper["paper_id"]].get("status") == "success"
+-            and osp.exists(write_log[paper["paper_id"]].get("paper_path", ""))
+-        ):
+-            continue
+-
+-        if not osp.isabs(paper["content_folder"]):
+-            paper["content_folder"] = osp.join(base_info_dir, paper["content_folder"])
+-        if not osp.isabs(paper["pdf_path"]):
+-            paper["pdf_path"] = osp.join(base_info_dir, paper["pdf_path"])
+-
+-        papers_to_process.append(paper)
+-
+-    return papers_to_process
+-
+-
+-def run_batch_writeup(
+-    latex_template_dir: str,
+-    process_root_folder: bool = True,
+-    root_input_folder: str = "",
+-    paper_info_path: str = "",
+-    output_dir: str = "",
+-    output_dir_prefix: str = "",
+-    date_str: str = "",
+-    idea_filename: str = "idea_sparse.md",
+-    experimental_log_filename: str = "experimental_log.md",
+-    writer_model_name: str = "gemini-3.1-pro-preview",
+-    research_cutoff: str = "2024-11",
+-    n_papers=-1,
+-    max_workers=4,
+-):
+-    if output_dir == "":
+-        output_dir = create_log_folder(prefix=output_dir_prefix, date_str=date_str)
+-    else:
+-        print(f"Resuming from output_dir = {output_dir}")
+-    os.makedirs(output_dir, exist_ok=True)
+-
+-    all_papers = _load_papers_from_config(
+-        process_root_folder, root_input_folder, paper_info_path, n_papers
+-    )
+-    write_log = _load_logs(output_dir)
+-
+-    papers_to_process = _filter_and_prepare_papers(
+-        all_papers, write_log, process_root_folder, paper_info_path
+-    )
+-
+-    print(
+-        f"Starting batch writeup for {len(papers_to_process)} papers (skipped {len(all_papers) - len(papers_to_process)} already done)."
+-    )
+-    print(f"Parallel execution with max_workers={max_workers}")
+-
+-    paper_writing_log_path = osp.join(output_dir, "paper_writing_log.json")
+-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+-        futures = {
+-            executor.submit(
+-                process_paper_task,
+-                paper,
+-                output_dir,
+-                latex_template_dir,
+-                idea_filename,
+-                experimental_log_filename,
+-                writer_model_name,
+-                research_cutoff,
+-            ): paper["paper_id"]
+-            for paper in papers_to_process
+-        }
+-
+-        for future in tqdm.tqdm(
+-            as_completed(futures), total=len(futures), desc="Writing Papers"
+-        ):
+-            paper_id = futures[future]
+-            try:
+-                result = future.result()
+-
+-                write_log[paper_id] = {
+-                    "status": result["status"],
+-                    "paper_path": result.get("paper_path", ""),
+-                }
+-
+-                with open(paper_writing_log_path, "w") as f:
+-                    json.dump(write_log, f, indent=4)
+-
+-            except Exception as e:
+-                print(f"Exception handling result for paper {paper_id}: {e}")
+-
+-    success_count = sum(
+-        1 for entry in write_log.values() if entry.get("status") == "success"
+-    )
+-    error_count = sum(
+-        1 for entry in write_log.values() if entry.get("status") in ["failed", "error"]
+-    )
+-
+-    print("\n" + "=" * 50)
+-    print("BATCH PROCESSING COMPLETE")
+-    print(f"Total Papers: {len(all_papers)}")
+-    print(f"Successfully written: {success_count}")
+-    print(f"Failed/Error: {error_count}")
+-    print(f"Logs saved to: {output_dir}")
+-    print("=" * 50 + "\n")
+-
+-    return paper_writing_log_path
+--- official/methods/paper_writer_with_plotting.py
++++ po_official/paper_writer_with_plotting.py
+@@ -12,4 +12,12 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++#
++# MODIFIED (2026, PaperOrchestra skill pack), from methods/paper_writer_with_plotting.py
++# at google-research/paper-orchestra@d9bae99. Changes: the 3-try loop resumes
++# from a saved attempt number (`start_try`, `on_try_failed`) because a run is
++# spread over several `po.py advance` invocations; each stage runs in a named
++# llm.scope; the literature/plotting threads run as llm.gather branches; the
++# batch-benchmark helpers were removed. Stage order, file layout, copies and
++# agent settings are unchanged.
+ 
+ import os
+@@ -19,15 +27,14 @@
+ import json
+ import time
+-import tqdm
+-from concurrent.futures import ProcessPoolExecutor, as_completed
+ 
+ from concurrent.futures import ThreadPoolExecutor
+-from methods.agents.outline_agent import OutlineAgent
+-from methods.agents.literature_review_agent import HybridLiteratureAgent
+-from methods.agents.section_writing_agent import SectionWritingAgent
+-from methods.agents.content_refinement_agent import ContentRefinementAgent
+-from methods.agents.plotting_agent import PlottingAgent
+-
+-from utils.common_utils import (
++from po_official.outline_agent import OutlineAgent
++from po_official.literature_review_agent import HybridLiteratureAgent
++from po_official.section_writing_agent import SectionWritingAgent
++from po_official.content_refinement_agent import ContentRefinementAgent
++from po_official.plotting_agent import PlottingAgent
++from po_official import llm
++
++from po_official.common_utils import (
+     create_log_folder,
+ )
+@@ -45,4 +52,6 @@
+     research_cutoff: str = "2024-11",
+     plotting_max_critic_rounds: int = 3,
++    start_try: int = 0,
++    on_try_failed=None,
+ ):
+     latex_writeup_dir = osp.join(base_dir, "latex_writeup")
+@@ -63,8 +72,9 @@
+ 
+     max_n_tries = 3
+-    cur_try = 0
++    cur_try = start_try
+     succeed = False
+ 
+     while (not succeed) and (cur_try < max_n_tries):
++        llm.configure(llm._CTX["calls_dir"], attempt=cur_try + 1)
+         try:
+             assert osp.exists(
+@@ -102,11 +112,12 @@
+             )
+             outline_file_path = osp.join(base_dir, "outline.json")
+-            outline_agent.run(
+-                idea_file=idea_file_path,
+-                experimental_log_file=experimental_log_file_path,
+-                latex_template_file=latex_template_path,
+-                conference_guidelines_file=guidelines_path,
+-                output_filepath=outline_file_path,
+-            )
++            with llm.scope("outline"):
++                outline_agent.run(
++                    idea_file=idea_file_path,
++                    experimental_log_file=experimental_log_file_path,
++                    latex_template_file=latex_template_path,
++                    conference_guidelines_file=guidelines_path,
++                    output_filepath=outline_file_path,
++                )
+             time_log["OutlineAgent"] = time.time() - _t0
+ 
+@@ -115,4 +126,5 @@
+             literature_agent_output_dir = osp.join(base_dir, "literature_agent_output")
+ 
++            @llm.scoped("lit")
+             def run_literature_agent():
+                 print("[DEBUG] Starting run_literature_agent")
+@@ -133,4 +145,5 @@
+                 return True
+ 
++            @llm.scoped("plot")
+             def run_plotting_agent():
+                 print("[DEBUG] Starting run_plotting_agent")
+@@ -150,10 +163,5 @@
+ 
+             _t1 = time.time()
+-            with ThreadPoolExecutor(max_workers=2) as executor:
+-                future_lit = executor.submit(run_literature_agent)
+-                future_plot = executor.submit(run_plotting_agent)
+-
+-                future_lit.result()
+-                plot_results = future_plot.result()
++            _lit_ok, plot_results = llm.gather(run_literature_agent, run_plotting_agent)
+             time_log["Parallel_Lit_and_Plot"] = time.time() - _t1
+ 
+@@ -205,5 +213,6 @@
+             )
+             raw_draft_tex_path = osp.join(latex_writeup_dir, "raw_draft_paper.tex")
+-            section_writing_agent.run(output_path=raw_draft_tex_path)
++            with llm.scope("section"):
++                section_writing_agent.run(output_path=raw_draft_tex_path)
+             time_log["SectionWritingAgent"] = time.time() - _t2
+ 
+@@ -232,7 +241,8 @@
+                 work_dir=content_refinement_workdir,
+             )
+-            content_refinment_agent_output_pdf_path = content_refinement_agent.run(
+-                texfile_path=raw_draft_tex_path
+-            )
++            with llm.scope("refine"):
++                content_refinment_agent_output_pdf_path = content_refinement_agent.run(
++                    texfile_path=raw_draft_tex_path
++                )
+             time_log["ContentRefinementAgent"] = time.time() - _t3
+             time_log["Total_Time_Span"] = time.time() - time_log["Start_Time_Absolute"]
+@@ -258,4 +268,6 @@
+             print(f"[Try {cur_try+1}/{max_n_tries}] EXCEPTION in perform_writeup:")
+             print(traceback.format_exc())
++            if on_try_failed is not None:
++                on_try_failed(cur_try + 1, traceback.format_exc())
+             cur_try += 1
+             if cur_try < max_n_tries:
+@@ -264,257 +276,2 @@
+     print(f"Writeup failed after {max_n_tries}! Stop here.")
+     return False
+-
+-
+-def process_paper_task(
+-    paper,
+-    output_dir,
+-    latex_template_dir,
+-    idea_filename,
+-    experimental_log_filename,
+-    writer_model_name,
+-    plotting_model_name,
+-    image_model_name,
+-    plotting_max_critic_rounds,
+-    research_cutoff,
+-):
+-    """
+-    Worker function to process a single paper.
+-    Returns a dictionary with results to be handled by the main thread.
+-    """
+-    try:
+-        paper_id = paper["paper_id"]
+-        print(f"Starting processing for paper '{paper_id}'...")
+-
+-        paper_dest_dir = osp.join(output_dir, paper_id)
+-        os.makedirs(paper_dest_dir, exist_ok=True)
+-        final_paper_path = osp.join(paper_dest_dir, "final_paper.pdf")
+-
+-        result = {
+-            "paper_id": paper_id,
+-            "status": "failed",
+-            "paper_path": "",
+-        }
+-
+-        if True:
+-            shutil.rmtree(paper_dest_dir, ignore_errors=True)
+-            os.makedirs(paper_dest_dir, exist_ok=True)
+-
+-            content_dest_dir = osp.join(paper_dest_dir, "raw_materials")
+-            os.makedirs(content_dest_dir, exist_ok=True)
+-            print(
+-                f"Copying content_folder from {paper['content_folder']} to {content_dest_dir}..."
+-            )
+-            shutil.copytree(
+-                src=paper["content_folder"], dst=content_dest_dir, dirs_exist_ok=True
+-            )
+-            print(f"Copying original paper to {content_dest_dir}...")
+-            shutil.copy(
+-                src=paper["pdf_path"],
+-                dst=osp.join(content_dest_dir, "original_paper.pdf"),
+-            )
+-
+-            success = write_single_paper(
+-                base_dir=paper_dest_dir,
+-                latex_template_dir=latex_template_dir,
+-                idea_filename=idea_filename,
+-                experimental_log_filename=experimental_log_filename,
+-                writer_model_name=writer_model_name,
+-                plotting_model_name=plotting_model_name,
+-                image_model_name=image_model_name,
+-                plotting_max_critic_rounds=plotting_max_critic_rounds,
+-                research_cutoff=research_cutoff,
+-            )
+-
+-            if success:
+-                result["status"] = "success"
+-                result["paper_path"] = final_paper_path
+-                print(f"Paper {paper_id} successfully written!")
+-            else:
+-                print(f"Paper {paper_id} writing failed.")
+-                return result
+-
+-        return result
+-
+-    except Exception as e:
+-        print(f"CRITICAL ERROR in worker for paper {paper['paper_id']}: {e}")
+-        print(traceback.format_exc())
+-        return {"paper_id": paper["paper_id"], "status": "error", "error": str(e)}
+-
+-
+-def _load_papers_from_config(
+-    process_root_folder: bool,
+-    root_input_folder: str,
+-    paper_info_path: str,
+-    n_papers: int,
+-):
+-    """Loads a list of paper dictionaries from either a root folder or a JSON file."""
+-    if process_root_folder:
+-        if not root_input_folder:
+-            raise ValueError(
+-                "Please provide root_input_folder if process_root_folder is True."
+-            )
+-        all_papers_candidates = []
+-        all_paper_ids_raw = os.listdir(root_input_folder)
+-        all_paper_ids = [
+-            paper_id
+-            for paper_id in all_paper_ids_raw
+-            if os.path.isdir(os.path.join(root_input_folder, paper_id))
+-        ]
+-        for paper_id in all_paper_ids:
+-            content_folder = os.path.join(root_input_folder, paper_id, "raw_materials")
+-            pdf_path = os.path.join(root_input_folder, paper_id, f"{paper_id}.pdf")
+-            if not os.path.exists(content_folder) or not os.path.exists(pdf_path):
+-                continue
+-            paper_entry = {
+-                "paper_id": paper_id,
+-                "content_folder": content_folder,
+-                "pdf_path": pdf_path,
+-            }
+-            all_papers_candidates.append(paper_entry)
+-    else:
+-        if not paper_info_path:
+-            raise ValueError(
+-                "Please provide paper_info_path if process_root_folder is False."
+-            )
+-        with open(paper_info_path, "r") as f:
+-            all_papers_candidates = json.load(f)
+-
+-    if n_papers < 0:
+-        n_papers = len(all_papers_candidates)
+-    else:
+-        n_papers = min(n_papers, len(all_papers_candidates))
+-
+-    return all_papers_candidates[:n_papers]
+-
+-
+-def _load_logs(output_dir: str):
+-    """Loads existing logs to support resuming a batch job."""
+-    paper_writing_log_path = osp.join(output_dir, "paper_writing_log.json")
+-    write_log = {}
+-    if osp.exists(paper_writing_log_path):
+-        with open(paper_writing_log_path, "r") as f:
+-            write_log = json.load(f)
+-        print(f"Loaded existing writing log with {len(write_log)} entries.")
+-
+-    return write_log
+-
+-
+-def _filter_and_prepare_papers(
+-    all_papers, write_log, process_root_folder, paper_info_path
+-):
+-    """Filters out completed papers and resolves paths."""
+-    papers_to_process = []
+-    base_info_dir = ""
+-    if (not process_root_folder) and (paper_info_path != ""):
+-        base_info_dir = osp.dirname(paper_info_path)
+-
+-    for paper in all_papers:
+-        # Check if already successfully processed in log
+-        if (
+-            paper["paper_id"] in write_log
+-            and write_log[paper["paper_id"]].get("status") == "success"
+-            and osp.exists(write_log[paper["paper_id"]].get("paper_path", ""))
+-        ):
+-            continue
+-
+-        if not osp.isabs(paper["content_folder"]):
+-            paper["content_folder"] = osp.join(base_info_dir, paper["content_folder"])
+-        if not osp.isabs(paper["pdf_path"]):
+-            paper["pdf_path"] = osp.join(base_info_dir, paper["pdf_path"])
+-
+-        papers_to_process.append(paper)
+-
+-    return papers_to_process
+-
+-
+-def run_batch_writeup(
+-    latex_template_dir: str,
+-    process_root_folder: bool = True,
+-    root_input_folder: str = "",
+-    paper_info_path: str = "",
+-    output_dir: str = "",
+-    output_dir_prefix: str = "",
+-    date_str: str = "",
+-    idea_filename: str = "idea_sparse.md",
+-    experimental_log_filename: str = "experimental_log.md",
+-    writer_model_name: str = "gemini-3.1-pro-preview",
+-    plotting_model_name: str = "gemini-3.1-pro-preview",
+-    image_model_name: str = "gemini-3-pro-image-preview",
+-    plotting_max_critic_rounds: int = 3,
+-    research_cutoff: str = "2024-11",
+-    n_papers=-1,
+-    max_workers=4,
+-):
+-    if output_dir == "":
+-        output_dir = create_log_folder(prefix=output_dir_prefix, date_str=date_str)
+-    else:
+-        print(f"Resuming from output_dir = {output_dir}")
+-    os.makedirs(output_dir, exist_ok=True)
+-
+-    all_papers = _load_papers_from_config(
+-        process_root_folder, root_input_folder, paper_info_path, n_papers
+-    )
+-    write_log = _load_logs(output_dir)
+-
+-    papers_to_process = _filter_and_prepare_papers(
+-        all_papers, write_log, process_root_folder, paper_info_path
+-    )
+-
+-    print(
+-        f"Starting batch writeup for {len(papers_to_process)} papers (skipped {len(all_papers) - len(papers_to_process)} already done)."
+-    )
+-    print(f"Parallel execution with max_workers={max_workers}")
+-
+-    paper_writing_log_path = osp.join(output_dir, "paper_writing_log.json")
+-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+-        futures = {
+-            executor.submit(
+-                process_paper_task,
+-                paper,
+-                output_dir,
+-                latex_template_dir,
+-                idea_filename,
+-                experimental_log_filename,
+-                writer_model_name,
+-                plotting_model_name,
+-                image_model_name,
+-                plotting_max_critic_rounds,
+-                research_cutoff,
+-            ): paper["paper_id"]
+-            for paper in papers_to_process
+-        }
+-
+-        for future in tqdm.tqdm(
+-            as_completed(futures), total=len(futures), desc="Writing Papers"
+-        ):
+-            paper_id = futures[future]
+-            try:
+-                result = future.result()
+-
+-                write_log[paper_id] = {
+-                    "status": result["status"],
+-                    "paper_path": result.get("paper_path", ""),
+-                }
+-
+-                with open(paper_writing_log_path, "w") as f:
+-                    json.dump(write_log, f, indent=4)
+-
+-            except Exception as e:
+-                print(f"Exception handling result for paper {paper_id}: {e}")
+-
+-    success_count = sum(
+-        1 for entry in write_log.values() if entry.get("status") == "success"
+-    )
+-    error_count = sum(
+-        1 for entry in write_log.values() if entry.get("status") in ["failed", "error"]
+-    )
+-
+-    print("\n" + "=" * 50)
+-    print("BATCH PROCESSING COMPLETE")
+-    print(f"Total Papers: {len(all_papers)}")
+-    print(f"Successfully written: {success_count}")
+-    print(f"Failed/Error: {error_count}")
+-    print(f"Logs saved to: {output_dir}")
+-    print("=" * 50 + "\n")
+-
+-    return paper_writing_log_path
+--- official/methods/prompts/outline_agent.py
++++ po_official/prompts/outline_agent.py
+@@ -12,6 +12,9 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+-
+-from utils.prompt_utils import UNIVERSAL_NO_LEAKAGE_PROMPT
++#
++# MODIFIED (2026, PaperOrchestra skill pack), from methods/prompts/outline_agent.py at
++# google-research/paper-orchestra@d9bae99: import paths only.
++
++from po_official.prompt_utils import UNIVERSAL_NO_LEAKAGE_PROMPT
+ 
+ outline_agent_system_prompt = (
+--- official/methods/prompts/literature_review_agent.py
++++ po_official/prompts/literature_review_agent.py
+@@ -12,6 +12,9 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++#
++# MODIFIED (2026, PaperOrchestra skill pack), from methods/prompts/literature_review_agent.py at
++# google-research/paper-orchestra@d9bae99: import paths only.
+ 
+-from utils.prompt_utils import UNIVERSAL_NO_LEAKAGE_PROMPT
++from po_official.prompt_utils import UNIVERSAL_NO_LEAKAGE_PROMPT
+ 
+ literature_review_agent_writter_prompt = """Role: Senior AI Researcher.
+--- official/methods/prompts/section_writing_agent.py
++++ po_official/prompts/section_writing_agent.py
+@@ -12,6 +12,9 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++#
++# MODIFIED (2026, PaperOrchestra skill pack), from methods/prompts/section_writing_agent.py at
++# google-research/paper-orchestra@d9bae99: import paths only.
+ 
+-from utils.prompt_utils import UNIVERSAL_NO_LEAKAGE_PROMPT
++from po_official.prompt_utils import UNIVERSAL_NO_LEAKAGE_PROMPT
+ 
+ section_writing_agent_prompt = """Role: Senior AI Researcher.
+--- official/methods/prompts/content_refinement_agent.py
++++ po_official/prompts/content_refinement_agent.py
+@@ -12,6 +12,9 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++#
++# MODIFIED (2026, PaperOrchestra skill pack), from methods/prompts/content_refinement_agent.py at
++# google-research/paper-orchestra@d9bae99: import paths only.
+ 
+-from utils.prompt_utils import UNIVERSAL_NO_LEAKAGE_PROMPT
++from po_official.prompt_utils import UNIVERSAL_NO_LEAKAGE_PROMPT
+ 
+ content_refinement_agent_system_prompt = """Role: Senior AI Researcher.
+--- official/utils/paper_banana_utils.py
++++ po_official/paper_banana_utils.py
+@@ -12,4 +12,13 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++#
++# MODIFIED (2026, PaperOrchestra skill pack), from utils/paper_banana_utils.py
++# at google-research/paper-orchestra@d9bae99. Changes: (1) generated plot code
++# runs in a separate Python process (official: exec() in-process), cached by
++# code hash; (2) DEVIATION: this host has no image model, so diagrams are drawn
++# by asking for matplotlib code instead of calling gemini-3-pro-image-preview
++# (see DIAGRAM_HOST_ADAPTER_NOTE); (3) json_repair is optional; (4) the
++# PaperBanana data folder can be set with PO_PAPERBANANA_DIR. All prompts and
++# the retrieve/plan/style/render/critique/caption flow are unchanged.
+ 
+ import base64
+@@ -18,17 +27,63 @@
+ import os
+ import json
+-import matplotlib.pyplot as plt
+-import json_repair
++import sys
++import hashlib
++import subprocess
+ from typing import Dict, Any, List, Tuple
+-from google.genai import types
+-
+-from utils.gemini_utils import (
++from po_official.genai_shim import types
++
++try:
++    import json_repair  # type: ignore
++except ImportError:
++    from po_official import llm as _llm
++
++    class _JsonRepair:
++        @staticmethod
++        def loads(text):
++            parsed = _llm.parse_gemini_json_results(text)
++            if parsed is None:
++                raise ValueError("could not parse JSON")
++            return parsed
++
++    json_repair = _JsonRepair()
++
++from po_official.llm import (
+     call_gemini_with_text_prompt,
+     call_gemini_with_contents,
+-    generate_image_with_gemini,
+ )
+ 
+ cur_dir = os.path.dirname(os.path.realpath(__file__))
+-PB_DIR = os.path.join(cur_dir, "../../PaperBanana")
++PB_DIR = os.environ.get("PO_PAPERBANANA_DIR") or os.path.join(cur_dir, "../../PaperBanana")
++
++PLOT_CACHE_DIR = {"path": None}
++
++# Same steps as the official in-process worker (Agg backend, rcdefaults,
++# exec, savefig JPEG at 300 dpi with tight bbox), run in a child process.
++_PLOT_RUNNER = r"""
++import sys, io, base64
++import matplotlib
++matplotlib.use("Agg")
++import matplotlib.pyplot as plt
++plt.switch_backend("Agg")
++plt.close("all")
++plt.rcdefaults()
++code_clean = open(sys.argv[1], encoding="utf-8").read()
++exec_globals = {}
++exec(code_clean, exec_globals)
++if plt.get_fignums():
++    buf = io.BytesIO()
++    plt.savefig(buf, format="jpeg", bbox_inches="tight", dpi=300)
++    plt.close("all")
++    buf.seek(0)
++    open(sys.argv[2], "w").write(base64.b64encode(buf.read()).decode("utf-8"))
++"""
++
++DIAGRAM_HOST_ADAPTER_NOTE = (
++    "[HOST ADAPTER - not part of the official prompt] This host cannot generate "
++    "images. Instead, write one self-contained Python script that uses matplotlib "
++    "(patches, arrows, text) to draw this diagram as faithfully as possible. Do not "
++    "call plt.show() or save files; leave the figure open. Only provide the code "
++    "without any explanations, in a ```python block."
++)
+ 
+ # ==========================================
+@@ -294,5 +349,5 @@
+     Independent plot code execution worker:
+     1. Extract code
+-    2. Execute plotting
++    2. Execute plotting (in a child process; cached by code hash)
+     3. Return JPEG as Base64 string
+     """
+@@ -300,22 +355,31 @@
+     code_clean = match.group(1).strip() if match else code_text.strip()
+ 
+-    plt.switch_backend("Agg")
+-    plt.close("all")
+-    plt.rcdefaults()
++    cache_dir = PLOT_CACHE_DIR["path"] or os.path.join(cur_dir, ".plot_cache")
++    os.makedirs(cache_dir, exist_ok=True)
++    digest = hashlib.sha256(code_clean.encode("utf-8")).hexdigest()[:24]
++    code_path = os.path.join(cache_dir, f"{digest}.py")
++    out_path = os.path.join(cache_dir, f"{digest}.b64")
++    done_path = os.path.join(cache_dir, f"{digest}.done")
++    if os.path.exists(done_path):
++        if os.path.exists(out_path):
++            with open(out_path, "r") as f:
++                return f.read()
++        return None
+ 
+     try:
+-        exec_globals = {}
+-        exec(code_clean, exec_globals)
+-        if plt.get_fignums():
+-            buf = io.BytesIO()
+-            plt.savefig(buf, format="jpeg", bbox_inches="tight", dpi=300)
+-            plt.close("all")
+-
+-            buf.seek(0)
+-            img_bytes = buf.read()
+-            return base64.b64encode(img_bytes).decode("utf-8")
+-        else:
+-            return None
+-
++        with open(code_path, "w", encoding="utf-8") as f:
++            f.write(code_clean)
++        result = subprocess.run(
++            [sys.executable, "-I", "-c", _PLOT_RUNNER, code_path, out_path],
++            capture_output=True, text=True, timeout=300, cwd=cache_dir,
++        )
++        if result.returncode != 0:
++            err = (result.stderr or "").strip().splitlines()
++            print(f"Error executing plot code: {err[-1] if err else result.returncode}")
++        open(done_path, "w").close()
++        if os.path.exists(out_path):
++            with open(out_path, "r") as f:
++                return f.read()
++        return None
+     except Exception as e:
+         print(f"Error executing plot code: {e}")
+@@ -671,11 +735,21 @@
+         # Prompt for diagram image generation
+         prompt_text = f"Render an image based on the following detailed description: {figure_description}\n Note that do not include figure titles in the image. Diagram: "
+-
+-        return generate_image_with_gemini(
++        # DEVIATION: official calls generate_image_with_gemini(image_model_name,
++        # prompt_text, aspect_ratio, system_instruction=DIAGRAM_VISUALIZER...).
++        # Here the same prompt goes to the host model with an adapter note, and
++        # the returned matplotlib code is rendered like a plot.
++        response_dict = call_gemini_with_contents(
++            contents=[
++                types.Part.from_text(text=prompt_text),
++                types.Part.from_text(
++                    text=DIAGRAM_HOST_ADAPTER_NOTE + f" Target aspect ratio: {aspect_ratio}."
++                ),
++            ],
+             model_name=image_model_name,
+-            prompt=prompt_text,
+-            aspect_ratio=aspect_ratio,
+             generation_configs={
+-                "system_instruction": DIAGRAM_VISUALIZER_AGENT_SYSTEM_PROMPT
++                "system_instruction": DIAGRAM_VISUALIZER_AGENT_SYSTEM_PROMPT,
++                "temperature": 0.7,
+             },
++            result_parsing_func=identity_parse,
+         )
++        return execute_plot_code_worker(response_dict["parsed_response"])
+--- official/utils/scholar_utils.py
++++ po_official/scholar_utils.py
+@@ -13,18 +13,99 @@
+ # limitations under the License.
+ 
++#
++# MODIFIED (2026, PaperOrchestra skill pack), from utils/scholar_utils.py at
++# google-research/paper-orchestra@d9bae99. Changes: (1) `thefuzz` and
++# `python-dotenv` are optional; without thefuzz, fuzz.ratio is computed with
++# the same formula (indel similarity, rounded); (2) every query result,
++# including failures, is cached so a resumed run replays identically;
++# (3) the API key is no longer printed; (4) PO_S2_MOCK_FILE lets tests supply
++# canned responses. The matching logic itself is unchanged.
++
+ import warnings
+ import os
++import json
+ import requests
+ import time
+ from typing import List, Dict, Union, Optional
+-from thefuzz import fuzz  # type: ignore
+ import datetime
+ 
+-from dotenv import load_dotenv  # type: ignore
++try:
++    from thefuzz import fuzz  # type: ignore
++except ImportError:  # same result as thefuzz>=0.20 fuzz.ratio
++
++    class _Fuzz:
++        @staticmethod
++        def ratio(s1: str, s2: str) -> int:
++            if not s1 and not s2:
++                return 100
++            prev = [0] * (len(s2) + 1)
++            for ch in s1:
++                cur = [0]
++                for j, ch2 in enumerate(s2, 1):
++                    cur.append(prev[j - 1] + 1 if ch == ch2 else max(prev[j], cur[j - 1]))
++                prev = cur
++            lcs = prev[-1]
++            return int(round(200.0 * lcs / (len(s1) + len(s2))))
++
++    fuzz = _Fuzz()
++
++try:
++    from dotenv import load_dotenv  # type: ignore
++except ImportError:
++    def load_dotenv(*_a, **_k):
++        return False
+ 
+ cur_dir = os.path.dirname(os.path.realpath(__file__))
+ load_dotenv(os.path.join(cur_dir, "../.env"))
+ S2_API_KEY = os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
+-print(f"Using S2 API Key: {S2_API_KEY}")
++print(f"Using S2 API Key: {'set' if S2_API_KEY else 'not set (public rate limit)'}")
++
++_S2_CACHE = {"path": None, "data": {}}
++
++
++def configure_s2_cache(path: str):
++    _S2_CACHE["path"] = path
++    _S2_CACHE["data"] = {}
++    if path and os.path.exists(path):
++        with open(path, "r", encoding="utf-8") as f:
++            _S2_CACHE["data"] = json.load(f)
++
++
++def _cache_key(title_query, year_hint, cutoff_date):
++    return json.dumps([title_query, year_hint, cutoff_date])
++
++
++def s2_is_cached(title_query, year_hint=None, cutoff_date=None) -> bool:
++    return _cache_key(title_query, year_hint, cutoff_date) in _S2_CACHE["data"]
++
++
++def _cache_put(key, value):
++    _S2_CACHE["data"][key] = value
++    if _S2_CACHE["path"]:
++        tmp = _S2_CACHE["path"] + ".tmp"
++        with open(tmp, "w", encoding="utf-8") as f:
++            json.dump(_S2_CACHE["data"], f)
++        os.replace(tmp, _S2_CACHE["path"])
++
++
++class _MockResponse:
++    def __init__(self, status_code, payload):
++        self.status_code = status_code
++        self._payload = payload
++
++    def json(self):
++        return self._payload
++
++
++def _s2_get(url, headers, params, timeout):
++    mock_file = os.environ.get("PO_S2_MOCK_FILE")
++    if mock_file:
++        with open(mock_file, "r", encoding="utf-8") as f:
++            table = json.load(f)
++        hit = table.get(params["query"])
++        if hit is None:
++            return _MockResponse(404, {})
++        return _MockResponse(200, {"data": hit})
++    return requests.get(url, headers=headers, params=params, timeout=timeout)
+ 
+ 
+@@ -33,4 +114,15 @@
+ 
+ def s2_title_search(
++    title_query: str, year_hint: int = None, cutoff_date: str = None
++) -> Optional[Dict]:
++    key = _cache_key(title_query, year_hint, cutoff_date)
++    if key in _S2_CACHE["data"]:
++        return _S2_CACHE["data"][key]
++    result = _s2_title_search_uncached(title_query, year_hint, cutoff_date)
++    _cache_put(key, result)
++    return result
++
++
++def _s2_title_search_uncached(
+     title_query: str, year_hint: int = None, cutoff_date: str = None
+ ) -> Optional[Dict]:
+@@ -60,5 +152,5 @@
+ 
+     try:
+-        rsp = requests.get(
++        rsp = _s2_get(
+             "https://api.semanticscholar.org/graph/v1/paper/search",
+             headers=headers,
+--- official/utils/pdf_utils.py
++++ po_official/pdf_utils.py
+@@ -12,23 +12,82 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++#
++# MODIFIED (2026, PaperOrchestra skill pack), from utils/pdf_utils.py at
++# google-research/paper-orchestra@d9bae99. Kept: load_paper, compile_latex,
++# pdf_to_grid_images (the three functions the pipeline uses). Changes:
++# PyMuPDF is optional (load_paper already fell back to pypdf; grids fall back
++# to poppler's pdftoppm); grids are composed with Pillow instead of OpenCV
++# (same pixels); `rich` output is plain text; compile_latex and the grids are
++# memoized by input hash so a resumed run does not rebuild finished PDFs.
+ 
+ import os
+-import subprocess
++import re
+ import json
+ import shutil
+-import rich
+-import traceback
++import hashlib
+ import subprocess
+-import os.path as osp
+-
+-import pymupdf4llm  # type: ignore
+-import pymupdf  # type: ignore
+-import numpy as np
+-import cv2
++import tempfile
++
+ from pypdf import PdfReader  # type: ignore
++
++_MEMO = {"cache_dir": None}
++
++
++def configure_memo(cache_dir: str):
++    _MEMO["cache_dir"] = cache_dir
++    if cache_dir:
++        os.makedirs(cache_dir, exist_ok=True)
++
++
++def _sha_file(path):
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        h.update(f.read())
++    return h.hexdigest()
++
++
++def _compile_inputs_hash(cwd, texfile_name):
++    h = hashlib.sha256(texfile_name.encode())
++    for name in sorted(os.listdir(cwd)):
++        p = os.path.join(cwd, name)
++        if os.path.isfile(p) and name.endswith((".tex", ".bib", ".sty", ".cls", ".bst")):
++            h.update(name.encode() + b"\x00" + _sha_file(p).encode())
++    return h.hexdigest()
++
++
++def _compile_memo_check(cwd, pdf_file, texfile_name):
++    """Restore a cached build of identical inputs instead of recompiling."""
++    cache_dir = _MEMO["cache_dir"]
++    if not cache_dir:
++        return None, False
++    digest = _compile_inputs_hash(cwd, texfile_name)
++    cached_pdf = os.path.join(cache_dir, f"{digest}.pdf")
++    if os.path.exists(cached_pdf):
++        shutil.copy(cached_pdf, pdf_file)
++        return digest, True
++    if os.path.exists(os.path.join(cache_dir, f"{digest}.fail")):
++        if os.path.exists(pdf_file):
++            os.remove(pdf_file)
++        return digest, True
++    return digest, False
++
++
++def _compile_memo_store(digest, pdf_file):
++    cache_dir = _MEMO["cache_dir"]
++    if not cache_dir or not digest:
++        return
++    if os.path.exists(pdf_file):
++        shutil.copy(pdf_file, os.path.join(cache_dir, f"{digest}.pdf"))
++    else:
++        open(os.path.join(cache_dir, f"{digest}.fail"), "w").close()
++
++
++def _plain_print(msg):
++    print(re.sub(r"\[/?[a-z ]+\]", "", str(msg)))
+ 
+ 
+ def load_paper(pdf_path, num_pages=None, min_size=100):
+     try:
++        import pymupdf  # type: ignore  # optional; pypdf fallback below
+         doc = pymupdf.open(pdf_path)
+         if num_pages:
+@@ -52,121 +111,12 @@
+ 
+ 
+-def has_blacklist_words(text: str):
+-    blacklists = ["corresponding author"]
+-    for word in blacklists:
+-        if word in text.lower():
+-            return True
+-    return False
+-
+-
+-def parse_sections(json_data, output_folder=""):
+-    if not output_folder:
+-        output_folder = os.path.dirname(json_data)
+-
+-    output_path = os.path.join(output_folder, "paper_sections.json")
+-    section_results = []
+-
+-    if "abstractText" in json_data:
+-        abstract_data = json_data["abstractText"]["text"]
+-        if abstract_data.startswith("Abstract"):
+-            abstract_data = abstract_data[len("Abstract") :]
+-        section_results.append({"title": "Abstract", "content": abstract_data})
+-
+-    section_data = json_data["sections"]
+-    for section in section_data:
+-        title = section["title"]["text"] if "title" in section else None
+-
+-        content = ""
+-        for para in section["paragraphs"]:
+-            if has_blacklist_words(para["text"]):
+-                continue
+-            content += para["text"]
+-
+-        if title:
+-            section_results.append({"title": title, "content": content})
+-        else:
+-            section_results[-1]["content"] += content
+-
+-    with open(output_path, "w") as f:
+-        json.dump(section_results, f, indent=4)
+-        print(f"Dumped paper sections to {output_path}.")
+-
+-    return section_results
+-
+-
+-papaer_text_to_reference_text_prompt_template = """
+-You are a specialized academic data extraction engine. Your task is to extract the "References" or "Bibliography" section from the raw text of a research paper and return it in a specific single-line string format.
+-
+-### INPUT DATA
+-You will receive raw text extracted from a PDF. This text may contain:
+-- Noise (headers, footers, page numbers).
+-- Arbitrary line breaks (sentences broken across lines).
+-- The body of the paper followed by the references.
+-
+-### INSTRUCTIONS
+-1. **Locate:** Find the start of the "References" or "Bibliography" section. Ignore all text preceding this section.
+-2. **Extract:** Identify individual reference entries. These typically start with bracketed numbers (e.g., [1], [2]) or bare numbers (1., 2.).
+-3. **Clean:** - Merge multi-line citations into a single line. 
+-   - Remove any page numbers or running headers that interrupt a citation.
+-4. **Format:** Output the citations as a single continuous string. Ensure every citation starts with its bracketed ID (e.g., `[1]`). If the source text uses `1.` format, convert it to `[1]`.
+-
+-### OUTPUT FORMAT
+-Your output must be a single string containing ONLY the references, formatted exactly as follows:
+-"[1] First citation text [2] Second citation text [3] Third citation text [4] ... "
+-
+-### CONSTRAINTS
+-- Do NOT output JSON, Markdown lists, or XML.
+-- Do NOT output the word "References" or "Bibliography" at the start.
+-- Do NOT output any conversational text (e.g., "Here are the references").
+-- Do NOT change the content/wording of the citation titles or authors, only clean up the whitespace.
+-
+-Here is the paper text:
+-[PAPER CONTENT]
+-{paper_text}
+-[END PAPER CONTENT]
+-"""
+-
+-
+-def extract_reference_from_pdf_text(
+-    paper_text: str, model_name: str = "gemini-3.1-pro-preview"
+-) -> str:
+-    from utils.llm_backend_utils import call_llm_with_text_prompt
+-
+-    instructions = papaer_text_to_reference_text_prompt_template.format(
+-        paper_text=paper_text
+-    )
+-    response_dict = call_llm_with_text_prompt(
+-        prompt=instructions,
+-        model_name=model_name,
+-        check_parsed_response_not_none=False,
+-        return_json=False,
+-    )
+-    return response_dict["raw_response"].strip()
+-
+-
+-def get_paper_references_from_pdf(
+-    pdf_path: str, model_name: str = "gemini-3.1-pro-preview"
+-):
+-    try:
+-        paper_text = load_paper(pdf_path)
+-        reference_text = extract_reference_from_pdf_text(
+-            paper_text, model_name=model_name
+-        )
+-        if reference_text:
+-            return reference_text
+-        else:
+-            print(
+-                f"Method 2: Failed to extract references from {pdf_path}.\nReturn None for refernces."
+-            )
+-    except Exception as e:
+-        print(
+-            f"Method 2: Failed to extract references from {pdf_path} due to {str(e)}.\nReturn None for refernces."
+-        )
+-
+-    return None
+ 
+ 
+ def compile_latex(cwd, pdf_file, texfile_name="template", timeout=30):
+-    import os, shutil, subprocess, traceback, rich
++    import os, shutil, subprocess, traceback
++
++    memo_key, memo_hit = _compile_memo_check(cwd, pdf_file, texfile_name)
++    if memo_hit:
++        return
+ 
+     source_pdf = os.path.join(cwd, f"{texfile_name}.pdf")
+@@ -223,8 +173,8 @@
+             shutil.move(source_pdf, pdf_file)
+         except Exception:
+-            rich.print(f"[bold red]Error moving generated PDF to {pdf_file}[/bold red]")
++            _plain_print(f"[bold red]Error moving generated PDF to {pdf_file}[/bold red]")
+             print(traceback.format_exc())
+     else:
+-        rich.print(
++        _plain_print(
+             f"\n[bold red]❌ PDF Generation Failed (No PDF file produced)[/bold red]"
+         )
+@@ -238,15 +188,17 @@
+                 header_color = "yellow"  # Warning/Error
+ 
+-            rich.print(
++            _plain_print(
+                 f"\n[bold {header_color}]---> Ran: {log['cmd']}[/bold {header_color}]"
+             )
+ 
+             if "error" in log:
+-                rich.print(f"[bold red]SYSTEM ERROR: {log['error']}[/bold red]")
++                _plain_print(f"[bold red]SYSTEM ERROR: {log['error']}[/bold red]")
+             else:
+                 if log["stdout"].strip():
+-                    rich.print(f"[dim]{log['stdout'].strip()}[/dim]")
++                    _plain_print(f"[dim]{log['stdout'].strip()}[/dim]")
+                 if log["stderr"].strip():
+-                    rich.print(f"[red]{log['stderr'].strip()}[/red]")
++                    _plain_print(f"[red]{log['stderr'].strip()}[/red]")
++
++    _compile_memo_store(memo_key, pdf_file)
+ 
+ 
+@@ -255,39 +207,53 @@
+     Returns a list of paths to the generated grid images.
+     """
+-    doc = pymupdf.open(pdf_path)
++    from PIL import Image  # type: ignore
++
+     os.makedirs(output_dir, exist_ok=True)
+-
+-    mat = pymupdf.Matrix(scale, scale)
+-    pixmaps = []
+-    for page in doc:
+-        pix = page.get_pixmap(matrix=mat)
+-        pixmaps.append(pix)
++    stamp = os.path.join(output_dir, ".source_sha256")
++    src_sha = _sha_file(pdf_path)
++    if os.path.exists(stamp):
++        with open(stamp, "r", encoding="utf-8") as f:
++            cached = f.read().split()
++        if cached and cached[0] == src_sha:
++            paths = [os.path.join(output_dir, n) for n in cached[1:]]
++            if all(os.path.exists(p) for p in paths):
++                return paths
++
++    pages = []
++    try:
++        import pymupdf  # type: ignore
++
++        doc = pymupdf.open(pdf_path)
++        mat = pymupdf.Matrix(scale, scale)
++        for page in doc:
++            pix = page.get_pixmap(matrix=mat)
++            mode = "RGBA" if pix.n == 4 else "RGB"
++            pages.append(Image.frombytes(mode, (pix.w, pix.h), pix.samples).convert("RGB"))
++    except ImportError:
++        with tempfile.TemporaryDirectory() as tmp:
++            subprocess.run(
++                ["pdftoppm", "-r", str(int(72 * scale)), "-png", pdf_path, os.path.join(tmp, "p")],
++                check=True, capture_output=True,
++            )
++            for name in sorted(os.listdir(tmp), key=lambda n: int(re.findall(r"(\d+)", n)[-1])):
++                pages.append(Image.open(os.path.join(tmp, name)).convert("RGB"))
+ 
+     grid_image_paths = []
+-
+-    for i in range(0, len(pixmaps), 4):
+-        chunk = pixmaps[i : i + 4]
+-
+-        img_list = []
+-        for pix in chunk:
+-            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+-                pix.h, pix.w, pix.n
+-            )
+-            img_list.append(img)
+-
+-        while len(img_list) < 4:
+-            ref_img = img_list[0]
+-            white_img = np.ones_like(ref_img) * 255
+-            img_list.append(white_img)
+-
+-        row1 = np.hstack((img_list[0], img_list[1]))
+-        row2 = np.hstack((img_list[2], img_list[3]))
+-        grid = np.vstack((row1, row2))
+-
++    for i in range(0, len(pages), 4):
++        chunk = pages[i : i + 4]
++        while len(chunk) < 4:
++            chunk.append(Image.new("RGB", chunk[0].size, (255, 255, 255)))
++        w0, h0 = chunk[0].size
++        w1, h1 = chunk[1].size
++        grid = Image.new("RGB", (w0 + w1, max(h0, h1) + max(chunk[2].size[1], chunk[3].size[1])), (255, 255, 255))
++        grid.paste(chunk[0], (0, 0))
++        grid.paste(chunk[1], (w0, 0))
++        grid.paste(chunk[2], (0, max(h0, h1)))
++        grid.paste(chunk[3], (chunk[2].size[0], max(h0, h1)))
+         grid_path = os.path.join(output_dir, f"grid_{i//4 + 1}.png")
+-        grid_bgr = cv2.cvtColor(grid, cv2.COLOR_RGB2BGR)
+-        cv2.imwrite(grid_path, grid_bgr)
+-
++        grid.save(grid_path)
+         grid_image_paths.append(grid_path)
+ 
++    with open(stamp, "w", encoding="utf-8") as f:
++        f.write(" ".join([src_sha] + [os.path.basename(p) for p in grid_image_paths]))
+     return grid_image_paths
+--- official/utils/gemini_utils.py
++++ po_official/llm.py
+@@ -12,60 +12,20 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++#
++# MODIFIED (2026, PaperOrchestra skill pack): replaces utils/gemini_utils.py
++# from google-research/paper-orchestra@d9bae99. The three response parsers
++# below are copied verbatim. The call functions keep the official signatures,
++# but instead of calling Gemini they write the exact model input to a prompt
++# file and wait for the host agent (Claude Code, Cursor, ...) to write the
++# reply. See skills/shared/official-call-protocol.md.
+ 
+ import re
+ import json
++import os
++import hashlib
++import contextlib
+ from typing import Dict, Any
+ 
+-from google import genai
+-from google.genai import types  # type: ignore
+-import time
+-import os
+-import mimetypes
+-import base64
+-import threading
+-
+-import dotenv
+-
+-dot_file = os.path.join(os.path.dirname(__file__), "../.env")
+-dotenv.load_dotenv(dot_file)
+-
+-_genai_client = None
+-_genai_client_lock = threading.Lock()
+-
+-
+-def get_genai_client() -> genai.Client:
+-    """Returns a shared Gemini client, creating it on first use.
+-
+-    The client is created lazily so that Gemini credentials are only required
+-    when a Gemini model is actually called (e.g. OpenAI-only setups don't need
+-    them). Vertex AI takes precedence over GEMINI_API_KEY when both are set.
+-    """
+-    global _genai_client
+-    if _genai_client is None:
+-        with _genai_client_lock:
+-            if _genai_client is None:
+-                vertex_ai_project = os.getenv("VERTEX_AI_PROJECT")
+-                vertex_ai_location = os.getenv("VERTEX_AI_LOCATION")
+-                gemini_api_key = os.getenv("GEMINI_API_KEY")
+-
+-                if vertex_ai_project and vertex_ai_location:
+-                    print(
+-                        f"Using Vertex AI configuration. Project: {vertex_ai_project}, Location: {vertex_ai_location}"
+-                    )
+-                    _genai_client = genai.Client(
+-                        vertexai=True,
+-                        project=vertex_ai_project,
+-                        location=vertex_ai_location,
+-                    )
+-                elif gemini_api_key:
+-                    print("Using Gemini API Key configuration.")
+-                    _genai_client = genai.Client(api_key=gemini_api_key)
+-                else:
+-                    raise ValueError(
+-                        "Either VERTEX_AI_PROJECT/VERTEX_AI_LOCATION or GEMINI_API_KEY"
+-                        " must be set to use Gemini models."
+-                    )
+-    return _genai_client
+-
++from po_official.genai_shim import Part
+ 
+ def parse_gemini_json_results(response: str):
+@@ -156,6 +116,234 @@
+ 
+ 
++
++def identity_parse(response: str):
++    return response
++
++
++# ---------------------------------------------------------------------------
++# Host-agent call layer (replaces the Gemini client)
++# ---------------------------------------------------------------------------
++
++OFFICIAL_DEFAULT_MAX_RETRIES = 5
++
++_CTX = {"calls_dir": None, "attempt": 1, "stack": [], "counters": {}}
++
++
++class Pending(BaseException):
++    """Raised when one or more LLM calls are waiting for a host reply.
++
++    Subclasses BaseException on purpose: the official code wraps many steps in
++    `except Exception`, and a pending call must pass through those handlers
++    untouched instead of being treated as a failure.
++    """
++
++    def __init__(self, calls):
++        super().__init__(f"{len(calls)} pending call(s)")
++        self.calls = list(calls)
++
++
++class StaleCallError(BaseException):
++    """Inputs of an already-answered call changed. BaseException so the
++    official try-loop does not count it as a failed attempt."""
++
++
++def configure(calls_dir: str, attempt: int = 1):
++    _CTX["calls_dir"] = calls_dir
++    _CTX["attempt"] = attempt
++    _CTX["stack"] = []
++    _CTX["counters"] = {}
++
++
++@contextlib.contextmanager
++def scope(name: str):
++    """Names a branch of the pipeline so call ids stay stable on replay."""
++    _CTX["stack"].append(str(name).replace("/", "_").replace(" ", "_"))
++    try:
++        yield
++    finally:
++        _CTX["stack"].pop()
++
++
++def scoped(name: str):
++    """Decorator form of scope()."""
++    def deco(fn):
++        def wrapper(*args, **kwargs):
++            with scope(name):
++                return fn(*args, **kwargs)
++        wrapper.__name__ = getattr(fn, "__name__", "scoped")
++        return wrapper
++    return deco
++
++
++def gather(*fns):
++    """Run independent branches; collect every pending call before stopping.
++
++    The official code runs these branches in threads. Here they run one after
++    another, and if any branch is waiting on the host, all waiting calls from
++    all branches are reported together so the host can answer them in parallel.
++    """
++    results, pending = [], []
++    for fn in fns:
++        try:
++            results.append(fn())
++        except Pending as p:
++            pending.extend(p.calls)
++            results.append(None)
++    if pending:
++        raise Pending(pending)
++    return results
++
++
++def _next_call_id() -> str:
++    path = "/".join(_CTX["stack"]) or "root"
++    n = _CTX["counters"].get(path, 0) + 1
++    _CTX["counters"][path] = n
++    return f"a{_CTX['attempt']}/{path}/c{n:02d}"
++
++
++def _ext_for(data: bytes, mime_type: str) -> str:
++    if data[:8] == b"\x89PNG\r\n\x1a\n":
++        return ".png"
++    if data[:3] == b"\xff\xd8\xff":
++        return ".jpg"
++    if data[:4] == b"%PDF":
++        return ".pdf"
++    return {"image/png": ".png", "image/jpeg": ".jpg", "application/pdf": ".pdf"}.get(
++        mime_type, ".bin"
++    )
++
++
++def _as_parts(contents):
++    if not isinstance(contents, (list, tuple)):
++        contents = [contents]
++    parts = []
++    for c in contents:
++        if isinstance(c, Part):
++            parts.append(c)
++        else:
++            parts.append(Part(text=str(c)))
++    return parts
++
++
++def _describe_settings(generation_configs: dict):
++    cfg = dict(generation_configs or {})
++    tools = []
++    for t in cfg.pop("tools", []) or []:
++        if getattr(t, "google_search", None) is not None:
++            tools.append("web_search")
++    system = cfg.pop("system_instruction", None)
++    return system, tools, cfg
++
++
++def _render(call_id, retry, contents, generation_configs, model_name, max_retries):
++    calls_dir = _CTX["calls_dir"]
++    if not calls_dir:
++        raise RuntimeError("llm.configure() was not called")
++    base = os.path.join(calls_dir, call_id)
++    os.makedirs(os.path.dirname(base), exist_ok=True)
++    prompt_path = f"{base}.r{retry}.prompt.md"
++    response_path = f"{base}.r{retry}.response.md"
++
++    system, tools, settings = _describe_settings(generation_configs)
++    parts = _as_parts(contents)
++
++    body, attachments, hasher = [], [], hashlib.sha256()
++    hasher.update(f"model={model_name}|settings={sorted(settings.items())!r}|tools={tools}".encode())
++    if system is not None:
++        body.append("=" * 24 + " SYSTEM INSTRUCTION " + "=" * 24)
++        body.append(str(system))
++        hasher.update(b"SYS\x00" + str(system).encode())
++    for i, p in enumerate(parts, 1):
++        if p.data is not None:
++            digest = hashlib.sha256(p.data).hexdigest()
++            att_path = f"{base}.att{i}{_ext_for(p.data, p.mime_type or '')}"
++            if not os.path.exists(att_path):
++                with open(att_path, "wb") as fh:
++                    fh.write(p.data)
++            attachments.append(att_path)
++            kind = "pdf" if att_path.endswith(".pdf") else "image"
++            body.append("=" * 24 + f" USER CONTENT · PART {i} (attachment: {kind}) " + "=" * 24)
++            body.append(f"[Attachment: {att_path} — open it with your Read tool]")
++            hasher.update(b"ATT\x00" + digest.encode())
++        else:
++            body.append("=" * 24 + f" USER CONTENT · PART {i} (text) " + "=" * 24)
++            body.append(p.text or "")
++            hasher.update(b"TXT\x00" + (p.text or "").encode())
++    body.append("=" * 24 + " END OF MODEL INPUT " + "=" * 24)
++    prompt_hash = hasher.hexdigest()
++
++    setting_str = ", ".join(f"{k}={v}" for k, v in sorted(settings.items())) or "defaults"
++    header = [
++        "<!-- PaperOrchestra official-mode LLM call -->",
++        f"<!-- prompt_sha256: {prompt_hash} -->",
++        f"# LLM call `{call_id}` (try {retry} of {max_retries})",
++        "",
++        "**Executor instructions (not part of the model input).** Act as the model for this one call.",
++        "Use the SYSTEM INSTRUCTION (if any) as your system prompt and the USER CONTENT parts, in order,",
++        "as the user turn. Open every attachment with your Read tool at the position it appears.",
++        "Use no other context: no repo files, no earlier conversation, no memory.",
++        ("You MAY use web search for this call (the official call used Gemini Google Search grounding)."
++         if tools else "Do NOT use web search or any other tool except Read for attachments."),
++        f"Write your complete reply, exactly as the model would return it, to `{response_path}`.",
++        "",
++        f"- Official model: `{model_name}`",
++        f"- Official generation settings: {setting_str} (this host cannot set them)",
++        f"- Tools: {', '.join(tools) if tools else 'none'}",
++    ]
++    if retry > 1:
++        header.append(
++            f"- This is a retry: the reply in try {retry - 1} could not be parsed by the official "
++            "parser. Follow the output format the prompt asks for exactly."
++        )
++    text = "\n".join(header) + "\n\n" + "\n".join(body) + "\n"
++
++    existing_hash = None
++    if os.path.exists(prompt_path):
++        with open(prompt_path, "r", encoding="utf-8") as fh:
++            m = re.search(r"prompt_sha256: ([0-9a-f]{64})", fh.read(400))
++            existing_hash = m.group(1) if m else None
++    if existing_hash != prompt_hash:
++        if existing_hash is not None and _has_response(response_path):
++            with open(prompt_path.replace(".prompt.md", ".prompt.changed.md"), "w", encoding="utf-8") as fh:
++                fh.write(text)
++            raise StaleCallError(
++                f"Inputs changed for answered call {call_id}. Run `po.py reset` and start again."
++            )
++        with open(prompt_path, "w", encoding="utf-8") as fh:
++            fh.write(text)
++    info = {
++        "id": f"{call_id}.r{retry}",
++        "prompt_file": prompt_path,
++        "response_file": response_path,
++        "tools": tools,
++        "attachments": attachments,
++        "official_model": model_name,
++    }
++    return info
++
++
++def _has_response(path):
++    return os.path.exists(path) and os.path.getsize(path) > 0
++
++
++def _invoke(contents, model_name, generation_configs, result_parsing_func,
++            check_parsed_response_not_none, max_retries):
++    call_id = _next_call_id()
++    for retry in range(1, max_retries + 1):
++        info = _render(call_id, retry, contents, generation_configs, model_name, max_retries)
++        if not _has_response(info["response_file"]):
++            raise Pending([info])
++        with open(info["response_file"], "r", encoding="utf-8") as fh:
++            raw_response = fh.read()
++        parsed_response = result_parsing_func(raw_response)
++        if check_parsed_response_not_none and parsed_response is None:
++            print(f"Warning: reply for {info['id']} could not be parsed; retrying.")
++            continue
++        return {"raw_response": raw_response, "parsed_response": parsed_response}
++    raise RuntimeError(f"Error: All {max_retries} retry attempts failed for {call_id}.")
++
++
+ def call_gemini_with_contents(
+-    contents: types.Content,
++    contents,
+     model_name: str,
+     max_retries: int = 5,
+@@ -165,62 +353,6 @@
+     check_parsed_response_not_none: bool = True,
+ ):
+-    """
+-    Calls the Gemini API (text-only) with retry logic and exponential backoff.
+-    """
+-
+-    raw_response = None
+-    parsed_response = None
+-
+-    genai_client = get_genai_client()
+-    for attempt in range(max_retries):
+-        try:
+-            response = genai_client.models.generate_content(
+-                model=model_name,
+-                contents=contents,
+-                config=types.GenerateContentConfig(**generation_configs),
+-            )
+-
+-            if not response or not hasattr(response, "text") or response.text is None:
+-                raise ValueError("Incomplete response from Gemini API or empty text")
+-
+-            raw_response = response.text
+-            parsed_response = result_parsing_func(raw_response)
+-
+-            if check_parsed_response_not_none:
+-                assert (
+-                    parsed_response is not None
+-                ), f"Parsed response is None, Here is the raw response:\n{raw_response}"
+-
+-            return {
+-                "raw_response": raw_response,
+-                "parsed_response": parsed_response,
+-            }
+-
+-        except Exception as e:
+-            error_msg = str(e)
+-            print(
+-                f"Warning: Gemini API call failed on attempt {attempt + 1} of {max_retries}. Error: {error_msg}",
+-            )
+-
+-            if (
+-                "maximum number of tokens allowed" in error_msg.lower()
+-                or "400 bad request" in error_msg.lower()
+-                or "code: 400" in error_msg.lower()
+-                or "400 invalid_argument" in error_msg.lower()
+-            ):
+-                print("Detected input token count exceed. Not retrying.")
+-                raise e
+-
+-            if attempt + 1 == max_retries:
+-                print(f"Error: All {max_retries} retry attempts failed.")
+-                raise e
+-
+-            delay = base_interval_sec * (2 ** (attempt - 1)) if attempt > 0 else 0
+-            print(f"Retrying in {delay} seconds...")
+-            if delay > 0:
+-                time.sleep(delay)
+-
+-    print("Error: Exited retry loop unexpectedly.")
+-    return {"raw_response": raw_response, "parsed_response": parsed_response}
++    return _invoke(contents, model_name, generation_configs, result_parsing_func,
++                   check_parsed_response_not_none, max_retries)
+ 
+ 
+@@ -234,7 +366,6 @@
+     base_interval_sec: int = 5,
+ ):
+-    contents = [types.Part(text=prompt)]
+     return call_gemini_with_contents(
+-        contents=contents,
++        contents=[Part(text=prompt)],
+         model_name=model_name,
+         result_parsing_func=result_parsing_func,
+@@ -248,5 +379,5 @@
+ def call_gemini_with_images(
+     prompt: str,
+-    images: list[str],
++    images: list,
+     model_name: str,
+     result_parsing_func: callable = parse_gemini_json_results,
+@@ -256,15 +387,10 @@
+     base_interval_sec: int = 5,
+ ):
+-    llm_contents = [
+-        types.Part.from_text(text=prompt),
+-    ]
++    llm_contents = [Part.from_text(text=prompt)]
+     for image_path in images:
+         with open(image_path, "rb") as f:
+             img_bytes = f.read()
+-        llm_contents.append(
+-            types.Part.from_bytes(data=img_bytes, mime_type="image/png")
+-        )
+-
+-    response_dict = call_gemini_with_contents(
++        llm_contents.append(Part.from_bytes(data=img_bytes, mime_type="image/png"))
++    return call_gemini_with_contents(
+         contents=llm_contents,
+         model_name=model_name,
+@@ -275,80 +401,27 @@
+         base_interval_sec=base_interval_sec,
+     )
+-    return response_dict
+-
+-
+-def generate_image_with_gemini(
++
++
++def call_llm_with_images(
++    prompt: str,
++    images: list,
+     model_name: str,
+-    prompt: str,
+-    aspect_ratio: str = "16:9",
+-    generation_configs: dict = None,
+-    max_retries: int = 5,
+-    base_interval_sec: int = 5,
+-    save_path: str = None,
+-) -> str:
+-    """
+-    Directly calls Gemini for image generation and returns base64.
+-    """
+-    if generation_configs is None:
+-        generation_configs = {}
+-
+-    genai_client = get_genai_client()
+-    for attempt in range(max_retries):
+-        try:
+-            config_args = {
+-                "temperature": 0.7,
+-                "candidate_count": 1,
+-                "response_modalities": ["IMAGE"],
+-                "image_config": types.ImageConfig(
+-                    aspect_ratio=aspect_ratio, image_size="1k"
+-                ),
+-            }
+-            config_args.update(generation_configs)
+-
+-            response = genai_client.models.generate_content(
+-                model=model_name,
+-                contents=[types.Part.from_text(text=prompt)],
+-                config=types.GenerateContentConfig(**config_args),
+-            )
+-            if hasattr(response, "candidates") and response.candidates:
+-                if (
+-                    len(response.candidates) > 0
+-                    and response.candidates[0].content
+-                    and response.candidates[0].content.parts
+-                ):
+-                    for part in response.candidates[0].content.parts:
+-                        if part.inline_data:
+-                            img_base64 = base64.b64encode(part.inline_data.data).decode(
+-                                "utf-8"
+-                            )
+-
+-                            if save_path:
+-                                try:
+-                                    os.makedirs(
+-                                        os.path.dirname(save_path), exist_ok=True
+-                                    )
+-                                    with open(save_path, "wb") as fh:
+-                                        fh.write(base64.b64decode(img_base64))
+-                                    print(
+-                                        f"Image for prompt '{prompt}' saved to {save_path}"
+-                                    )
+-                                except Exception as e:
+-                                    print(
+-                                        f"Warning: Failed to save image to {save_path}: {e}"
+-                                    )
+-
+-                            return img_base64
+-        except Exception as e:
+-            print(f"Warning: Gemini API image generation failed {e}.")
+-            if attempt + 1 == max_retries:
+-                print(
+-                    f"Error: All {max_retries} retry attempts failed for image generation."
+-                )
+-                break
+-
+-            delay = base_interval_sec * (2 ** (attempt - 1)) if attempt > 0 else 0
+-            print(f"Retrying in {delay} seconds...")
+-            if delay > 0:
+-                time.sleep(delay)
+-
+-    return None
++    generation_configs=None,
++    check_parsed_response_not_none: bool = True,
++    return_json: bool = True,
++    result_parsing_func=None,
++):
++    """Same contract as utils/llm_backend_utils.call_llm_with_images."""
++    parser = (
++        result_parsing_func
++        if result_parsing_func is not None
++        else (parse_gemini_json_results if return_json else identity_parse)
++    )
++    return call_gemini_with_images(
++        prompt=prompt,
++        images=images,
++        model_name=model_name,
++        result_parsing_func=parser,
++        generation_configs=generation_configs or {},
++        check_parsed_response_not_none=check_parsed_response_not_none,
++    )
+--- official/autoraters/agent_review.py
++++ po_official/agent_review.py
+@@ -12,10 +12,24 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++#
++# MODIFIED (2026, PaperOrchestra skill pack), from autoraters/agent_review.py
++# at google-research/paper-orchestra@d9bae99. Changes: the 3 ensemble reviews
++# are issued as independent host calls (reported together); numpy is optional
++# (same mean-and-round result). Prompts, persona, rubric, meta-review and score
++# aggregation are unchanged.
+ 
+ import os
+ import json
+-import numpy as np
+-
+-from utils.gemini_utils import call_gemini_with_text_prompt
++try:
++    import numpy as np
++except ImportError:  # same arithmetic for small int lists
++    class _NP:
++        @staticmethod
++        def mean(xs):
++            return sum(xs) / len(xs)
++
++    np = _NP()
++
++from po_official.llm import call_gemini_with_text_prompt, gather, scope
+ 
+ # --- AGENTREVIEW SPECIFIC CONSTANTS (From role_descriptions.py) ---
+@@ -133,16 +147,25 @@
+     if num_review_ensemble > 1:
+         parsed_reviews = []
+-        for i in range(num_review_ensemble):
+-            print(f"Generating ensemble review {i + 1}/{num_review_ensemble}...")
+-            response = call_gemini_with_text_prompt(
+-                prompt=base_prompt,
+-                model_name=model_name,
+-                generation_configs={
+-                    "temperature": temperature,
+-                    "system_instruction": reviewer_system_prompt,
+-                },
+-            )
+-            parsed_reviews.append(response["parsed_response"])
+-        review = get_meta_review(model_name, temperature, parsed_reviews)
++
++        def _make_reviewer(i):
++            def _reviewer():
++                with scope(f"ens{i + 1}"):
++                    print(f"Generating ensemble review {i + 1}/{num_review_ensemble}...")
++                    response = call_gemini_with_text_prompt(
++                        prompt=base_prompt,
++                        model_name=model_name,
++                        generation_configs={
++                            "temperature": temperature,
++                            "system_instruction": reviewer_system_prompt,
++                        },
++                    )
++                    return response["parsed_response"]
++            return _reviewer
++
++        parsed_reviews.extend(
++            gather(*[_make_reviewer(i) for i in range(num_review_ensemble)])
++        )
++        with scope("meta"):
++            review = get_meta_review(model_name, temperature, parsed_reviews)
+         if review is None:
+             review = parsed_reviews[0]

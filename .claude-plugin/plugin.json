@@ -1,0 +1,19 @@
+{
+  "name": "paper-orchestra",
+  "version": "0.4.1",
+  "description": "PaperOrchestra (arXiv:2604.05018) as coding-agent skills: turn an idea, an experiment log, a LaTeX template and guidelines into a submission-ready LaTeX paper. Official mode runs a port of Google's released pipeline with your agent answering each model call; no model API key needed.",
+  "author": {
+    "name": "Aryan Dalal"
+  },
+  "homepage": "https://github.com/aryand1/paper-orchestra-skill",
+  "repository": "https://github.com/aryand1/paper-orchestra-skill",
+  "license": "MIT",
+  "keywords": [
+    "paper-writing",
+    "latex",
+    "research",
+    "literature-review",
+    "peer-review",
+    "paperorchestra"
+  ]
+}
